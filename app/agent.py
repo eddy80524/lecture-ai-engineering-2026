@@ -24,6 +24,7 @@ from pydantic_ai.messages import ToolCallPart, ToolReturnPart
 from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.providers.google import GoogleProvider
+from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
 
 from app import tools
 from app.config import MODEL, api_error_message, get_api_key
@@ -32,34 +33,33 @@ INSTRUCTIONS = """\
 あなたはAIエンジニアリング講座（AIE2026）の学習支援エージェントです。
 - 用語や講座に固有のことを答える前に、必ず search_glossary で用語集を確認する。
 - 回の内容を聞かれたら get_lecture_summary を使う。
+- クイズを出してと言われたら make_quiz を使う。
+- 学習の記録やメモの保存を頼まれたら save_learning_log を使う。
 - 用語集に見つからないことは、推測で断定せず「用語集にはない」と伝える。
 - 回答の最後に、関係する回（第N回）を示す。
 - 宿題の答えそのものは書かず、考え方のヒントで導く。
 """
 
 # モデルは実行時に渡す（テストではAPIを呼ばない TestModel に差し替えるため）
-agent = Agent(instructions=INSTRUCTIONS)
+# DeferredToolRequests を output_type に追加することで承認待ちを許容
+agent: Agent[None, str | DeferredToolRequests] = Agent(
+    instructions=INSTRUCTIONS,
+    output_type=[str, DeferredToolRequests],
+)
 agent.tool_plain(tools.search_glossary)
 agent.tool_plain(tools.get_lecture_summary)
+agent.tool_plain(tools.make_quiz)
 
-# TODO(第3回 演習): tools.py に make_quiz を作り、ここで登録しよう
+# 宿題（実装：Human-in-the-Loop）
+# 記録の保存は副作用を伴うため requires_approval=True を指定
+agent.tool_plain(tools.save_learning_log, requires_approval=True)
 
 # 第5回: 使う MCP サーバーの設定ファイル。Claude Desktop や Cursor と同じ "mcpServers" 形式
 MCP_CONFIG = Path(__file__).resolve().parent / "mcp_servers.json"
 
 
 def load_mcp_servers(config_path: Path = MCP_CONFIG) -> list[MCPToolset]:
-    """設定ファイル（mcpServers 形式）を読み、サーバーごとに接続（MCPToolset）を作る。
-
-    - "command" があれば stdio：サーバーをサブプロセスとして起動する
-    - "url" があれば Streamable HTTP：起動済みのサーバーに接続する
-    ツール名には「サーバー名_」を付ける（例: glossary_search_glossary）。複数のサーバーに
-    同じ名前のツールがあっても区別できるようにするため。
-
-    Pydantic AI には同じことをする load_mcp_toolsets() もある。ここで自分で組み立てているのは、
-    古い SDK で作られたサーバー（fetch など）につなぐとき、接続方式の自動判定（"auto"）が
-    警告を大量に出すため。"legacy" に固定すると新旧どちらのサーバーにも静かにつながる。
-    """
+    """設定ファイル（mcpServers 形式）を読み、サーバーごとに接続（MCPToolset）を作る。"""
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))["mcpServers"]
     toolsets = []
     for name, spec in config.items():
@@ -81,11 +81,7 @@ def build_model() -> GoogleModel:
 
 
 def print_tools(target: Agent) -> None:
-    """モデルに見えているツールの一覧（名前・説明文・引数）を表示する。LLM は呼ばない。
-
-    TestModel（テストで使う偽モデル）にツール一覧を渡し、そこから読み出す。
-    MCP サーバーのツールも、第3回の関数ツールも、モデルから見れば同じ形をしている。
-    """
+    """モデルに見えているツールの一覧（名前・説明文・引数）を表示する。LLM は呼ばない。"""
     model = TestModel(call_tools=[])
     target.run_sync("ツール一覧", model=model)
     tools_seen = model.last_model_request_parameters.function_tools
@@ -127,11 +123,37 @@ def main() -> None:
     print(f"[model] {MODEL}")
     if args.mcp:
         print("[tools] MCP サーバー（app/mcp_servers.json）")
+
+    model = build_model()
     try:
-        result = target.run_sync(args.question, model=build_model())
+        result = target.run_sync(args.question, model=model)
+
+        # 承認待ち（DeferredToolRequests）が返ってきた場合の処理
+        while isinstance(result.output, DeferredToolRequests):
+            deferred: DeferredToolRequests = result.output
+            approvals = {}
+
+            for call in deferred.approvals:
+                print(f"\n[承認確認] ツール「{call.tool_name}」を実行しようとしています。")
+                print(f"引数: {call.args}")
+                choice = input("この操作を実行しますか？ (y/n): ").strip().lower()
+                if choice == "y":
+                    approvals[call.tool_call_id] = ToolApproved()
+                else:
+                    approvals[call.tool_call_id] = ToolDenied("ユーザーによって実行が拒否されました。")
+
+            # deferred_tool_results として渡して再開（プロンプトは渡さない）
+            tool_results = DeferredToolResults(approvals=approvals)
+            result = target.run_sync(
+                message_history=result.all_messages(),
+                deferred_tool_results=tool_results,
+                model=model,
+            )
+
     except ModelHTTPError as e:
         print(api_error_message(e.status_code, str(e.body)[:200]))
         raise SystemExit(1)
+
     print(result.output)
     if args.trace:
         print_trace(result)
