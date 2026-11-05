@@ -5,10 +5,12 @@
 """
 
 import json
+import random
 from functools import cache
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+LOG_DIR = Path(__file__).resolve().parent.parent / "learning_log"
 MAX_RESULTS = 3
 
 
@@ -19,7 +21,7 @@ def load_glossary() -> list[dict]:
 
 
 def _normalize(text: str) -> str:
-    return text.casefold().replace(" ", "").replace("　", "")
+    return text.casefold().replace(" ", "").replace(" ", "")
 
 
 def _names(entry: dict) -> list[str]:
@@ -77,3 +79,44 @@ def get_lecture_summary(lecture: int) -> str:
         available = sorted(p.stem for p in (DATA_DIR / "lectures").glob("*.md"))
         return f"第{lecture}回の要点はまだありません。用意されている回: {', '.join(available)}"
     return path.read_text(encoding="utf-8")
+
+
+def make_quiz(lecture_number: int) -> str:
+    """指定した回の用語集から、ランダムに1問クイズ（用語の定義から用語名を当てさせる問題）を作成して返す。
+
+    講義の復習や確認問題を出してほしいと頼まれたときに使う。
+
+    Args:
+        lecture_number: 講義の回数（1〜5の整数）
+    """
+    terms = [
+        entry for entry in load_glossary()
+        if entry.get("lecture") == lecture_number
+    ]
+    if not terms:
+        return f"第{lecture_number}回の用語は見つかりませんでした。"
+
+    target = random.choice(terms)
+    return (
+        f"【第{lecture_number}回 クイズ】\n"
+        f"問題: 次の定義に当てはまる用語は何でしょうか？\n"
+        f"「{target['definition']}」\n\n"
+        f"（正解: {target['term']}）"
+    )
+
+
+def save_learning_log(title: str, content: str) -> str:
+    """学習した内容やまとめを記録ファイルとして保存する。
+
+    ユーザーから学習記録の保存を依頼されたときや、まとめを保存したいときに使う。
+
+    Args:
+        title: 保存する記録のタイトル（ファイル名の一部になります）
+        content: 保存する学習内容やまとめの本文
+    """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    # ファイル名として安全な文字列に簡易変換
+    safe_title = "".join(c for c in title if c.isalnum() or c in ("-", "_")).strip() or "log"
+    file_path = LOG_DIR / f"{safe_title}.md"
+    file_path.write_text(content, encoding="utf-8")
+    return f"学習記録を保存しました: {file_path.name}"
